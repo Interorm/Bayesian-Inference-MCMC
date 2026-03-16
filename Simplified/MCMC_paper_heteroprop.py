@@ -198,7 +198,7 @@ def RobbinsMonroe(param:torch.Tensor, accept:torch.Tensor, n_step:int, acceptanc
     return torch.exp(param_new_log)
 
 
-def Adaptive_Burnin(BURNIN:int, K:int, SIGMA_ALPHA:float, SIGMA_DENSITY:float, TARGET_ACCEPT:float,
+def Adaptive_Burnin(BURNIN:int, K:int, SIGMA_ALPHA:float, SIGMA_DENSITY:float, TARGET_ACCEPT:tuple,
                     X:torch.Tensor, T:torch.Tensor, alpha_prior:tuple, density_lambda:float, 
                     CHAINS:int, CUDA:torch.device,
                     checkpoint:int, visualize:bool=True):
@@ -206,6 +206,8 @@ def Adaptive_Burnin(BURNIN:int, K:int, SIGMA_ALPHA:float, SIGMA_DENSITY:float, T
     P = X.shape[0]
     R = X.shape[1]
     C = T.shape[1]
+
+    target_joint, target_component = TARGET_ACCEPT
     
 
     K_HISTORY = torch.zeros(CHAINS, BURNIN, 2)
@@ -218,7 +220,7 @@ def Adaptive_Burnin(BURNIN:int, K:int, SIGMA_ALPHA:float, SIGMA_DENSITY:float, T
 
 
     alpha = (torch.zeros(CHAINS, R, C - 1) + torch.eye(R,C - 1).unsqueeze(0)).to(CUDA)
-    beta = (torch.ones(CHAINS, P, R, C) / C).to(CUDA)
+    beta = (torch.ones(CHAINS, P, R, C) / C).to(CUDA)   
     density = torch.ones(CHAINS, R).to(CUDA)
 
     burnin_steps = tqdm.tqdm(range(1, BURNIN), desc="Burnin Steps",  position=0, leave=False)
@@ -236,9 +238,9 @@ def Adaptive_Burnin(BURNIN:int, K:int, SIGMA_ALPHA:float, SIGMA_DENSITY:float, T
         SIGMA_ALPHA_HISTORY[:, step - 1, :, :, 1] = acceptrate_alpha
         SIGMA_DENSITY_HISTORY[:, step - 1, :, 1] = acceptrate_density
 
-        K_HISTORY[:, step, 0] = RobbinsMonroe(K.cpu(), acceptrate_beta, step, False, target_accept=TARGET_ACCEPT)
-        SIGMA_ALPHA_HISTORY[:, step, :, :, 0] = RobbinsMonroe(SIGMA_ALPHA.cpu(), acceptrate_alpha, step, target_accept=TARGET_ACCEPT)
-        SIGMA_DENSITY_HISTORY[:, step, :, 0] = RobbinsMonroe(SIGMA_DENSITY.cpu(), acceptrate_density, step, target_accept=TARGET_ACCEPT)
+        K_HISTORY[:, step, 0] = RobbinsMonroe(K.cpu(), acceptrate_beta, step, False, target_accept=target_joint)
+        SIGMA_ALPHA_HISTORY[:, step, :, :, 0] = RobbinsMonroe(SIGMA_ALPHA.cpu(), acceptrate_alpha, step, target_accept=target_component)
+        SIGMA_DENSITY_HISTORY[:, step, :, 0] = RobbinsMonroe(SIGMA_DENSITY.cpu(), acceptrate_density, step, target_accept=target_component)
 
         if visualize: 
             if step % checkpoint == 0 or step == BURNIN - 1:
@@ -420,11 +422,12 @@ def render_diagnostics(diag, ALPHAS:torch.Tensor, DENSITY:torch.Tensor, step:int
 
 
 def render_burnin_diagnostic(k_history:torch.Tensor, alpha_history:torch.Tensor, density_history:torch.Tensor, 
-                             step:int, target_accept:float=0.234):
+                             step:int, target_accept:tuple):
 
     CHAINS, BURNIN, R, C, _  = alpha_history.shape
+    target_joint, target_component = target_accept
 
-    fig = plt.figure(figsize=(6 * C + 6, 4 * R + 4), constrained_layout=True)
+    fig = plt.figure(figsize=(6 * R + 6, 8 * (C + 1)), constrained_layout=True)
     fig.patch.set_facecolor("#0e1117")
     gs  = gridspec.GridSpec(R + 1, (C + 1) * 2, figure=fig)
 
@@ -448,15 +451,15 @@ def render_burnin_diagnostic(k_history:torch.Tensor, alpha_history:torch.Tensor,
         ax_beta_param.plot(range(step), k_history[chain, :step, 0].numpy(), color="#7eb8f7", linewidth=0.8)
         ax_beta_acc.plot(range(step), k_history[chain, :step, 1], color="#7eb8f7", linewidth=0.8)
 
-    mean_value = alpha[:, :step, 0].mean(dim=0).numpy()
+    mean_value = k_history[:, :step, 0].mean(dim=0).numpy()
     ax_beta_param.plot(range(step), mean_value, color='white', linewidth=1.5, label="Mean")
     ax_beta_param.set_title('Parameter', color='yellow', fontsize=10)
     ax_beta_param.legend(fontsize=7, labelcolor="white",
                 facecolor="#1a1d27", edgecolor="#2e3250")
 
-    mean_accept = alpha[:, :step, 1].mean(dim=0).numpy()
+    mean_accept = k_history[:, :step, 1].mean(dim=0).numpy()
     ax_beta_acc.plot(range(step), mean_accept, color='white', linewidth=1.5, label="Mean")
-    ax_beta_acc.axhline(target_accept, color='red', linestyle='--', label=f'Target Acceptance: {target_accept}')
+    ax_beta_acc.axhline(target_joint, color='red', linestyle='--', label=f'Target Acceptance: {target_joint}')
     ax_beta_acc.set_ylim(0, 1)
     ax_beta_acc.set_title('Acceptance Rate', color='yellow', fontsize=10)
     ax_beta_acc.legend(fontsize=7, labelcolor="white",
@@ -480,7 +483,7 @@ def render_burnin_diagnostic(k_history:torch.Tensor, alpha_history:torch.Tensor,
 
         mean_accept = alpha[:, :step, 1].mean(dim=0).numpy()
         ax_accept.plot(range(step), mean_accept, color='white', linewidth=1.5, label="Mean")
-        ax_accept.axhline(target_accept, color='red', linestyle='--', label=f'Target Acceptance: {target_accept}')
+        ax_accept.axhline(target_component, color='red', linestyle='--', label=f'Target Acceptance: {target_component}')
         ax_accept.set_ylim(0, 1)
         ax_accept.set_title('Acceptance Rate', color='yellow', fontsize=10)
         ax_accept.legend(fontsize=7, labelcolor="white",
@@ -504,7 +507,7 @@ def render_burnin_diagnostic(k_history:torch.Tensor, alpha_history:torch.Tensor,
 
         mean_accept = density[:, :step, 1].mean(dim=0).numpy()
         ax_accept.plot(range(step), mean_accept, color='white', linewidth=1.5, label="Mean")
-        ax_accept.axhline(target_accept, color='red', linestyle='--', label=f'Target Acceptance: {target_accept}')
+        ax_accept.axhline(target_component, color='red', linestyle='--', label=f'Target Acceptance: {target_component}')
         ax_accept.set_ylim(0, 1)
         ax_accept.set_title('Acceptance Rate', color='yellow', fontsize=10)
         ax_accept.legend(fontsize=7, labelcolor="white",
@@ -523,7 +526,7 @@ def render_burnin_diagnostic(k_history:torch.Tensor, alpha_history:torch.Tensor,
 def EI_MCMC(X:torch.Tensor, T:torch.Tensor,
             CHAINS:int, STEPS:int, BURNIN:int, THINNING:int,
             alpha_prior:tuple, density_lambda,                      # Additions to improve mixing
-            K:float, SIGMA_ALPHA:float, SIGMA_DENSITY:float, AdaptiveBurnin:bool=True, TARGET_ACCEPT:float=0.234,
+            K:float, SIGMA_ALPHA:float, SIGMA_DENSITY:float, AdaptiveBurnin:bool=True, TARGET_ACCEPT:tuple=(0.234,0.44),
             save_betas:bool=True, force_cpu:bool=False, visualize:bool=True, checkpoint:int=1000):
     
 
