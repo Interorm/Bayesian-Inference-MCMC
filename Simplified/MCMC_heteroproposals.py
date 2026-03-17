@@ -132,19 +132,21 @@ def alpha_step(alpha:torch.Tensor, sigma:torch.Tensor,
 
 
 
-def propose_density(density:torch.Tensor, sigma:torch.Tensor):
+def propose_density(density:torch.Tensor, sigma:torch.Tensor, e:float=1e-5):
 
-    density_prop = dist.Normal(
-                            loc = density,
+    tau = (density - 1 + e).log()
+    tau_prop = dist.Normal(
+                            loc = tau,
                             scale = sigma
-                        ).sample().clamp(min=1e-6)
+                        ).sample()
+    density_prop = tau_prop.exp() + 1 - e
 
     return density_prop
 
 
 def acceptance_density(density:torch.Tensor, density_prop:torch.Tensor,
                        alpha:torch.Tensor, beta:torch.Tensor, 
-                       density_lambda:float):
+                       density_lambda:tuple):
     
     CHAINS, P, R, C = beta.shape
 
@@ -158,18 +160,20 @@ def acceptance_density(density:torch.Tensor, density_prop:torch.Tensor,
 
     log_kernel = ( (eta_prop - eta) * beta.log().sum(dim=1) ).sum(dim=2)
 
+    lambda1, lambda2 = density_lambda
+    log_prior = (lambda1 - 1) * (density_prop - density) + lambda2 * (density - density_prop)
 
-    log_prior = (density - density_prop) * density_lambda
+    log_transform = (density_prop - 1).log() - (density - 1).log()
 
 
-    log_acceptance = log_gammasum + log_sumgamma + log_kernel + log_prior
+    log_acceptance = log_gammasum + log_sumgamma + log_kernel + log_prior + log_transform
 
     return log_acceptance
 
 
 def density_step(density:torch.Tensor, sigma:torch.Tensor, 
                  alpha:torch.Tensor, beta:torch.Tensor, 
-                 density_lambda:float):
+                 density_lambda:tuple):
 
     density_prop = propose_density(density, sigma)
 
@@ -219,9 +223,9 @@ def Adaptive_Burnin(BURNIN:int, K:int, SIGMA_ALPHA:float, SIGMA_DENSITY:float, T
     SIGMA_DENSITY_HISTORY[:, 0, :,  0] = SIGMA_DENSITY
 
 
-    alpha = (torch.zeros(CHAINS, R, C - 1) + torch.eye(R,C - 1).unsqueeze(0)).to(CUDA)
-    beta = (torch.ones(CHAINS, P, R, C) / C).to(CUDA)   
-    density = torch.ones(CHAINS, R).to(CUDA)
+    alpha = (torch.ones(CHAINS, R, C - 1) + torch.eye(R,C - 1).unsqueeze(0)).to(CUDA)
+    beta = torch.ones(CHAINS, P, R, C).to(CUDA) / C
+    density = torch.ones(CHAINS, R).to(CUDA) * 2
 
     burnin_steps = tqdm.tqdm(range(1, BURNIN), desc="Burnin Steps",  position=0, leave=False)
     for step in burnin_steps:
@@ -244,11 +248,11 @@ def Adaptive_Burnin(BURNIN:int, K:int, SIGMA_ALPHA:float, SIGMA_DENSITY:float, T
 
         if visualize: 
             if step % checkpoint == 0 or step == BURNIN - 1:
-                render_burnin_diagnostic(K_HISTORY, SIGMA_ALPHA_HISTORY, SIGMA_DENSITY_HISTORY, step, TARGET_ACCEPT)
+                render_burnin_diagnostic(K_HISTORY, SIGMA_ALPHA_HISTORY, SIGMA_DENSITY_HISTORY, step, TARGET_ACCEPT, 20)
                 display(burnin_steps.container)
 
     K = K_HISTORY[:, -1, 0].to(CUDA)
-    SIGMA_ALPHA = SIGMA_ALPHA_HISTORY[:, -1, :, : 0].to(CUDA)
+    SIGMA_ALPHA = SIGMA_ALPHA_HISTORY[:, -1, :, :, 0].to(CUDA)
     SIGMA_DENSITY = SIGMA_DENSITY_HISTORY[:, -1, :, 0].to(CUDA)
 
     return K, SIGMA_ALPHA, SIGMA_DENSITY, alpha, beta, density
@@ -308,13 +312,15 @@ def compute_histograms(PARAM:torch.Tensor, n_hist:int):
     return histogram.permute(0, 2, 1), hist_coords.permute(0, 2, 1)
 
 
-def render_diagnostics(diag, ALPHAS:torch.Tensor, DENSITY:torch.Tensor, step:int, 
-                       n_hist:int=50): #Visualization by Claude
+def render_diagnostics(diag, ALPHAS:torch.Tensor, DENSITY:torch.Tensor, step:int, TARGET_ACCEPT:tuple,
+                       n_hist:int=50, window:int=50): #Visualization by Claude
     
     CHAINS, _, R, C = ALPHAS.shape
+    step_range = np.arange(step)
+    target_accept_joint, target_accept_component = TARGET_ACCEPT
 
     fig = plt.figure(figsize=(4 * C + 4, 9 + 3*R), constrained_layout=True)
-    fig.patch.set_facecolor("#0e1117")
+    fig.patch.set_facecolor("#0e1117")  
     gs  = gridspec.GridSpec(3 + R, C + 1, figure=fig)
 
     ax_timing     = fig.add_subplot(gs[0, :C//2 + 1])
@@ -339,24 +345,23 @@ def render_diagnostics(diag, ALPHAS:torch.Tensor, DENSITY:torch.Tensor, step:int
         style(ax)
 
     # Acceptance Rate
-    for ax, key, color, label in [
-            (ax_acc_beta,  "accept_beta",  "#7eb8f7", "Beta Accept Rate"),
-            (ax_acc_alpha, "accept_alpha", "#f7a97e", "Alpha Accept Rate"),
-            (ax_acc_density, "accept_density", "#cc8cb6", "Density Accept Rate"),
+    for ax, key, color, label, target_accept in [
+            (ax_acc_beta,  "accept_beta",  "#7eb8f7", "Beta Accept Rate", target_accept_joint),
+            (ax_acc_alpha, "accept_alpha", "#f7a97e", "Alpha Accept Rate", target_accept_component),
+            (ax_acc_density, "accept_density", "#cc8cb6", "Density Accept Rate", target_accept_component),
         ]:
         for chain in range(CHAINS):
-            s_vals = [(s, v[chain].mean()) for s, v in diag[key]]
-            if s_vals:
-                ss, vs = zip(*s_vals)
-                ax.plot(ss, vs, alpha=0.4, linewidth=0.8, color=color)
+            accepts = [acccept_tensor[chain].mean().numpy() for acccept_tensor in diag[key]]
+            accept_rate = np.convolve(accepts, np.ones(window)/window, mode='valid')
+            ax.plot(step_range[window-1:], accept_rate, alpha=0.4, linewidth=0.8, color=color)
 
         # Mean
-        m_vals  = [(s, v.mean()) for s, v in diag[key]]
-        ms, mv = zip(*m_vals)
-        ax.plot(ms, mv, color="white", linewidth=1.5, label="mean")
+        mean_accepts = [acccept_tensor.mean().numpy() for acccept_tensor in diag[key]]
+        mean_accept_rate = np.convolve(mean_accepts, np.ones(window)/window, mode='valid')
+        ax.plot(step_range[window-1:], mean_accept_rate, color="white", linewidth=1.5, label="mean")
 
-        ax.axhline(0.234, color="#ff6b6b", linewidth=0.8,
-                   linestyle="--", label="0.234 optimal")
+        ax.axhline(target_accept, color="#ff6b6b", linewidth=0.8,
+                   linestyle="--", label=f"{target_accept} optimal")
         ax.set_ylim(0, 1)
         ax.set_title(label, color=color, fontsize=10)
         ax.legend(fontsize=7, labelcolor="white",
@@ -364,27 +369,25 @@ def render_diagnostics(diag, ALPHAS:torch.Tensor, DENSITY:torch.Tensor, step:int
 
 
     # Time per Iteration
-    if diag["step_times"]:
-        ts, tv = zip(*diag["step_times"])
-        ax_timing.plot(ts, tv, color="#a8d8a8", linewidth=1)
+    ax_timing.plot(step_range, diag['step_times'], color="#a8d8a8", linewidth=1)
 
     ax_timing.set_title("Time per Step (s)", color="#a8d8a8", fontsize=10)
 
 
-    # Last Acceptance
-    last_beta  = [diag['accept_beta'][-1][1][chain] for chain in range(CHAINS)]
-    last_alpha = [diag['accept_alpha'][-1][1][chain] for chain in range(CHAINS)]
-    last_density = [diag['accept_density'][-1][1][chain] for chain in range(CHAINS)]
+    # Mean Acceptance
+    mean_beta  = torch.stack(diag['accept_beta'], dim=1).mean(dim=(1)).numpy()
+    mean_alpha = torch.stack(diag['accept_alpha'], dim=1).mean(dim=(1,2,3)).numpy()
+    mean_density = torch.stack(diag['accept_density'], dim=1).mean(dim=(1,2)).numpy()
     x = np.arange(CHAINS)
 
-    ax_chain_info.bar(x - 0.3, last_beta,  0.3, color="#7eb8f7", label="beta",  alpha=0.8)
-    ax_chain_info.bar(x , last_alpha,  0.3, color="#f7a97e", label="alpha",  alpha=0.8)
-    ax_chain_info.bar(x + 0.3, last_density, 0.3, color="#cc8cb6", label="density", alpha=0.8)
+    ax_chain_info.bar(x - 0.3, mean_beta,  0.3, color="#7eb8f7", label="beta",  alpha=0.8)
+    ax_chain_info.bar(x , mean_alpha,  0.3, color="#f7a97e", label="alpha",  alpha=0.8)
+    ax_chain_info.bar(x + 0.3, mean_density, 0.3, color="#cc8cb6", label="density", alpha=0.8)
 
     ax_chain_info.set_xticks(x)
     ax_chain_info.set_xticklabels([f"C{i}" for i in x], fontsize=7, color=TICK)
     ax_chain_info.set_ylim(0, 1)
-    ax_chain_info.set_title("Per-Chain Accept (last step)", color="#d4b8f7", fontsize=10)
+    ax_chain_info.set_title("Per-Chain Mean Acceptance", color="#d4b8f7", fontsize=10)
     ax_chain_info.legend(fontsize=7, labelcolor="white", facecolor=BG, edgecolor=SPINE)
 
 
@@ -422,12 +425,12 @@ def render_diagnostics(diag, ALPHAS:torch.Tensor, DENSITY:torch.Tensor, step:int
 
 
 def render_burnin_diagnostic(k_history:torch.Tensor, alpha_history:torch.Tensor, density_history:torch.Tensor, 
-                             step:int, target_accept:tuple):
+                             step:int, target_accept:tuple, window:int):
 
     CHAINS, BURNIN, R, C, _  = alpha_history.shape
     target_joint, target_component = target_accept
 
-    fig = plt.figure(figsize=(6 * R + 6, 8 * (C + 1)), constrained_layout=True)
+    fig = plt.figure(figsize=(8 * (C + 1), 4 * (R+ 1)), constrained_layout=True)
     fig.patch.set_facecolor("#0e1117")
     gs  = gridspec.GridSpec(R + 1, (C + 1) * 2, figure=fig)
 
@@ -467,22 +470,24 @@ def render_burnin_diagnostic(k_history:torch.Tensor, alpha_history:torch.Tensor,
 
 
     # Alpha
-    alphas = [alpha_history.reshape(CHAINS, BURNIN, R*C, 2)[:, :step, i, :] for i in range(R*C)]
+    alpha_history = alpha_history.reshape(CHAINS, BURNIN, R*C, 2)
+    alpha_values = [alpha_history[:, :step, i, 0] for i in range(R*C)]
+    alpha_accept = [alpha_history[:, :step, i, 1].unfold(dimension=1, size=window, step=1).mean(dim=-1) for i in range(R*C)]
 
-    for alpha, ax_value, ax_accept in zip(alphas, ax_alpha_param, ax_alpha_acc):
+    for value, accept, ax_value, ax_accept in zip(alpha_values, alpha_accept, ax_alpha_param, ax_alpha_acc):
 
         for chain in range(CHAINS):
-            ax_value.plot(range(step), alpha[chain, :, 0].numpy(), color="#f7a97e", linewidth=0.8)
-            ax_accept.plot(range(step), alpha[chain, :, 1], color="#f7a97e", linewidth=0.8)
+            ax_value.plot(range(step), value[chain, :].numpy(), color="#f7a97e", linewidth=0.8)
+            ax_accept.plot(range(window-1, step), accept[chain, :].numpy(), color="#f7a97e", linewidth=0.8)
 
-        mean_value = alpha[:, :step, 0].mean(dim=0).numpy()
+        mean_value = value.mean(dim=0).numpy()
         ax_value.plot(range(step), mean_value, color='white', linewidth=1.5, label="Mean")
         ax_value.set_title('Parameter', color='yellow', fontsize=10)
         ax_value.legend(fontsize=7, labelcolor="white",
                   facecolor="#1a1d27", edgecolor="#2e3250")
 
-        mean_accept = alpha[:, :step, 1].mean(dim=0).numpy()
-        ax_accept.plot(range(step), mean_accept, color='white', linewidth=1.5, label="Mean")
+        mean_accept = accept.mean(dim=0).numpy()
+        ax_accept.plot(range(window-1, step), mean_accept, color='white', linewidth=1.5, label="Mean")
         ax_accept.axhline(target_component, color='red', linestyle='--', label=f'Target Acceptance: {target_component}')
         ax_accept.set_ylim(0, 1)
         ax_accept.set_title('Acceptance Rate', color='yellow', fontsize=10)
@@ -491,22 +496,23 @@ def render_burnin_diagnostic(k_history:torch.Tensor, alpha_history:torch.Tensor,
         
     
     # Density
-    densities = [density_history[:, :step, i, :] for i in range(R)]
+    density_values = [density_history[:, :step, i, 0] for i in range(R)]
+    density_accept = [density_history[:, :step, i, 1].unfold(dimension=1, size=window, step=1).mean(dim=-1) for i in range(R)]
 
-    for density, ax_value, ax_accept in zip(densities, ax_density_param, ax_density_acc):
+    for value, accept, ax_value, ax_accept in zip(density_values, density_accept, ax_density_param, ax_density_acc):
 
         for chain in range(CHAINS):
-            ax_value.plot(range(step), density[chain, :, 0].numpy(), color="#cc8cb6", linewidth=0.8)
-            ax_accept.plot(range(step), density[chain, :, 1], color="#cc8cb6", linewidth=0.8)
+            ax_value.plot(range(step), value[chain, :].numpy(), color="#f7a97e", linewidth=0.8)
+            ax_accept.plot(range(window-1, step), accept[chain, :].numpy(), color="#f7a97e", linewidth=0.8)
 
-        mean_value = density[:, :step, 0].mean(dim=0).numpy()
+        mean_value = value.mean(dim=0).numpy()
         ax_value.plot(range(step), mean_value, color='white', linewidth=1.5, label="Mean")
         ax_value.set_title('Parameter', color='yellow', fontsize=10)
         ax_value.legend(fontsize=7, labelcolor="white",
                   facecolor="#1a1d27", edgecolor="#2e3250")
 
-        mean_accept = density[:, :step, 1].mean(dim=0).numpy()
-        ax_accept.plot(range(step), mean_accept, color='white', linewidth=1.5, label="Mean")
+        mean_accept = accept.mean(dim=0).numpy()
+        ax_accept.plot(range(window-1, step), mean_accept, color='white', linewidth=1.5, label="Mean")
         ax_accept.axhline(target_component, color='red', linestyle='--', label=f'Target Acceptance: {target_component}')
         ax_accept.set_ylim(0, 1)
         ax_accept.set_title('Acceptance Rate', color='yellow', fontsize=10)
@@ -525,7 +531,7 @@ def render_burnin_diagnostic(k_history:torch.Tensor, alpha_history:torch.Tensor,
 
 def EI_MCMC(X:torch.Tensor, T:torch.Tensor,
             CHAINS:int, STEPS:int, BURNIN:int, THINNING:int,
-            alpha_prior:tuple, density_lambda,                      # Additions to improve mixing
+            alpha_prior:tuple, density_lambda:tuple,                      # Additions to improve mixing
             K:float, SIGMA_ALPHA:float, SIGMA_DENSITY:float, AdaptiveBurnin:bool=True, TARGET_ACCEPT:tuple=(0.234,0.44),
             save_betas:bool=True, force_cpu:bool=False, visualize:bool=True, checkpoint:int=1000):
     
@@ -552,9 +558,9 @@ def EI_MCMC(X:torch.Tensor, T:torch.Tensor,
         SIGMA_ALPHA = torch.full((CHAINS, R, C-1), SIGMA_ALPHA).to(CUDA)
         SIGMA_DENSITY = torch.full((CHAINS, R), SIGMA_DENSITY).to(CUDA)
 
-        alpha = (torch.zeros(CHAINS, R, C - 1) + torch.eye(R,C - 1).unsqueeze(0)).to(CUDA)
-        beta = (torch.ones(CHAINS, P, R, C) / C).to(CUDA)
-        density = torch.ones(CHAINS, R).to(CUDA)
+        alpha = (torch.ones(CHAINS, R, C - 1) + torch.eye(R,C - 1).unsqueeze(0)).to(CUDA)
+        beta = torch.ones(CHAINS, P, R, C).to(CUDA) / C
+        density = torch.ones(CHAINS, R).to(CUDA) * 2
 
         burnin_steps = tqdm.tqdm(range(1, BURNIN), desc="Burnin Steps",  position=0, leave=False)
         for step in burnin_steps:
@@ -572,10 +578,10 @@ def EI_MCMC(X:torch.Tensor, T:torch.Tensor,
     # Main Loop
     if visualize:
         diag = {
-            "accept_beta":  [],   # (step, list of values)
-            "accept_alpha": [],
-            "accept_density": [],
-            "step_times":   [],   # (step, seconds)
+            "accept_beta":  [],   # list of tensors Chains,
+            "accept_alpha": [],   # list of tensors Chains, R, C
+            "accept_density": [], # list of tensors Chains, R
+            "step_times":   [],   # list of seconds
         }
 
         progress_steps  = tqdm.tqdm(range(1, STEPS), desc="Steps",  position=0)
@@ -591,15 +597,15 @@ def EI_MCMC(X:torch.Tensor, T:torch.Tensor,
             DENSITY[:, step, :] = density.clone().cpu()
 
 
-            diag["accept_beta" ].append((step, acceptrate_beta))
-            diag["accept_alpha"].append((step, acceptrate_alpha))
-            diag["accept_density"].append((step, acceptrate_density))
+            diag["accept_beta" ].append(acceptrate_beta)
+            diag["accept_alpha"].append(acceptrate_alpha)
+            diag["accept_density"].append(acceptrate_density)
             t_elapsed = time.perf_counter() - t_start
-            diag["step_times"].append((step, t_elapsed))
+            diag["step_times"].append(t_elapsed)
 
 
             if step == STEPS - 1 or step % checkpoint == 0:
-                render_diagnostics(diag, ALPHAS, DENSITY, step)
+                render_diagnostics(diag, ALPHAS, DENSITY, step, TARGET_ACCEPT)
                 display(progress_steps.container)
 
 
