@@ -35,7 +35,7 @@ def acceptance_beta(beta:torch.Tensor, beta_prop:torch.Tensor,
     theta_prop = theta[:, :, None, :] + (X[None, :, :, None] * (beta_prop - beta))
     log_likelihood = T[None, :, None, :] * (torch.log(theta_prop) - torch.log(theta[: ,:, None, :]))
 
-    log_proposal = k * (beta_prop * beta_log - beta * beta_prop_log) + \
+    log_proposal = (k * beta_prop - 1) * beta_log - (k * beta - 1) * beta_prop_log + \
                    gammaln(k * beta) - gammaln(k * beta_prop)
     
 
